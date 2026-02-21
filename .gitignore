@@ -7,14 +7,6 @@ dist/
 build/
 *.spec
 
-# Database & data artifacts
-data/nba_analytics.db
-data/backtest_cache/
-data/cache/
-data/cache/team_logos/
-data/ml_models/*.json
-data/app_settings.json
-
 # IDE
 .vscode/
 .idea/
