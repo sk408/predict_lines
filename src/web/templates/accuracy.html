@@ -1,0 +1,880 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="page-title">Accuracy</h1>
+
+<div class="card">
+  <h2>Backtest Settings</h2>
+  <div class="form-group">
+    <label for="home">Home Team (optional)</label>
+    <select id="home">
+      <option value="">Any</option>
+      {% for t in teams %}
+      <option value="{{ t.id }}">{{ t.abbr }} - {{ t.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div class="form-group">
+    <label for="away">Away Team (optional)</label>
+    <select id="away">
+      <option value="">Any</option>
+      {% for t in teams %}
+      <option value="{{ t.id }}">{{ t.abbr }} - {{ t.name }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <div class="form-group">
+    <label for="injuries">Injury Adjustments</label>
+    <select id="injuries">
+      <option value="true">On</option>
+      <option value="false">Off</option>
+    </select>
+  </div>
+
+  <div class="form-group">
+    <label class="opt-checkbox-label">
+      <input type="checkbox" id="use-cache" checked>
+      Use cached results
+      <span id="cache-age" class="text-muted" style="font-size: 0.8rem;"></span>
+    </label>
+  </div>
+
+  <div class="form-group">
+    <label for="workers">Workers</label>
+    <input type="number" id="workers" value="4" min="1" max="16" step="1"
+           title="Number of parallel threads. More = faster but more CPU. 4 is a good default.">
+  </div>
+
+  <button id="btn-run-backtest" onclick="startBacktest()">Run Backtest</button>
+</div>
+
+<!-- Progress log (hidden until backtest runs) -->
+<div id="bt-progress-card" class="card" style="display:none;">
+  <h2>Progress</h2>
+  <div id="bt-log" class="log" style="max-height: 200px; overflow-y: auto;"></div>
+</div>
+
+<!-- Error box -->
+<div id="bt-error" class="error-box" style="display:none;"></div>
+
+<!-- Results container (populated by JS) -->
+<div id="bt-results"></div>
+
+<!-- Empty state (shown when no results) -->
+<div id="bt-empty" class="card">
+  <div class="empty-state">
+    <p>No results yet</p>
+    <p class="text-muted">Run a backtest to see accuracy metrics</p>
+  </div>
+</div>
+
+<!-- Model Optimisation -->
+<div class="card">
+  <h2>Model Optimisation</h2>
+  <p class="text-muted" style="margin-bottom: 12px;">
+    Improve prediction accuracy by optimising model weights, building spread calibration,
+    or analysing which features help the most.
+  </p>
+  <!-- Settings row: Trials + Force re-run -->
+  <div class="opt-settings">
+    <div class="form-group opt-trials-group">
+      <label for="opt-trials">Trials</label>
+      <input type="number" id="opt-trials" value="200" min="50" max="2000" step="50"
+             title="Number of weight combinations to evaluate. More = better but slower. 200 default, 500+ for thorough.">
+    </div>
+    <label class="opt-checkbox-label">
+      <input type="checkbox" id="force-rerun"> Force re-run
+    </label>
+  </div>
+  <!-- Optimization buttons -->
+  <div class="opt-actions">
+    <button id="btn-optimize" onclick="startOptimize()">Optimize Weights</button>
+    <button id="btn-team-refine" onclick="startTeamRefinement()">Per-Team Refinement</button>
+    <button id="btn-optimize-all" onclick="startOptimizeAll()" class="btn-primary">Optimize All</button>
+    <button id="btn-ml-train" onclick="startMLTrain()" class="btn-primary">Train ML Model</button>
+  </div>
+  <!-- Pipeline & continuous -->
+  <div class="opt-actions">
+    <button id="btn-pipeline" onclick="startFullPipeline()" class="btn-primary">Full Pipeline</button>
+    <button id="btn-continuous" onclick="startContinuousOpt()" class="btn-success">Continuous Optimize</button>
+    <button id="btn-cancel-pipeline" onclick="cancelRunning()" class="btn-cancel" style="display:none;">Cancel</button>
+  </div>
+  <!-- Analysis buttons -->
+  <div class="opt-actions">
+    <button id="btn-calibrate" onclick="startCalibrate()">Build Calibration</button>
+    <button id="btn-features" onclick="startFeatureImportance()">Feature Importance</button>
+    <button id="btn-grouped" onclick="startGroupedImportance()">Grouped Importance</button>
+    <button id="btn-ml-features" onclick="startMLFeatureImportance()">ML Feature Importance</button>
+    <button id="btn-fft" onclick="startFFTAnalysis()">Error Patterns (FFT)</button>
+  </div>
+  <!-- Reset -->
+  <div class="opt-actions">
+    <button id="btn-clear-weights" onclick="clearWeights()" class="btn-muted">Reset Weights</button>
+  </div>
+  <div id="opt-log" class="log" style="max-height: 200px; overflow-y: auto; display: none;"></div>
+  <div id="opt-results" style="display: none; margin-top: 12px;"></div>
+</div>
+
+<script>
+/* ── Backtest via SSE (non-blocking) ── */
+let backtestES = null;
+
+function startBacktest() {
+  // Gather params
+  const home = document.getElementById('home').value;
+  const away = document.getElementById('away').value;
+  const inj = document.getElementById('injuries').value;
+  const cache = document.getElementById('use-cache').checked ? '1' : '0';
+  const workers = document.getElementById('workers').value || '4';
+
+  // Reset UI
+  const btn = document.getElementById('btn-run-backtest');
+  btn.disabled = true;
+  btn.textContent = 'Running...';
+
+  const logCard = document.getElementById('bt-progress-card');
+  const logEl = document.getElementById('bt-log');
+  logCard.style.display = 'block';
+  logEl.innerHTML = '';
+
+  document.getElementById('bt-error').style.display = 'none';
+  document.getElementById('bt-results').innerHTML = '';
+  document.getElementById('bt-empty').style.display = 'none';
+
+  // Close any existing connection
+  if (backtestES) { backtestES.close(); backtestES = null; }
+
+  const url = '/api/backtest?home_team_id=' + encodeURIComponent(home) +
+    '&away_team_id=' + encodeURIComponent(away) +
+    '&use_injuries=' + encodeURIComponent(inj) +
+    '&use_cache=' + encodeURIComponent(cache) +
+    '&max_workers=' + encodeURIComponent(workers);
+
+  backtestES = new EventSource(url);
+
+  backtestES.onmessage = function(e) {
+    const msg = e.data;
+    if (msg.startsWith('[RESULTS_JSON] ')) {
+      try {
+        const data = JSON.parse(msg.substring(15));
+        renderBacktestResults(data);
+      } catch (err) {
+        console.error('Failed to parse backtest results', err);
+      }
+    } else if (msg.startsWith('[DONE]')) {
+      backtestES.close();
+      backtestES = null;
+      btn.disabled = false;
+      btn.textContent = 'Run Backtest';
+      // Append done message
+      const div = document.createElement('div');
+      div.textContent = msg;
+      div.style.fontWeight = '700';
+      logEl.appendChild(div);
+      logEl.scrollTop = logEl.scrollHeight;
+      updateCacheAge();
+    } else if (msg.startsWith('[ERROR]')) {
+      backtestES.close();
+      backtestES = null;
+      btn.disabled = false;
+      btn.textContent = 'Run Backtest';
+      const errBox = document.getElementById('bt-error');
+      errBox.textContent = msg.substring(8);
+      errBox.style.display = 'block';
+    } else {
+      // Progress message
+      const div = document.createElement('div');
+      div.textContent = msg;
+      logEl.appendChild(div);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+  };
+
+  backtestES.onerror = function() {
+    backtestES.close();
+    backtestES = null;
+    btn.disabled = false;
+    btn.textContent = 'Run Backtest';
+  };
+}
+
+function _accClass(val, goodThresh, badThresh) {
+  if (val >= goodThresh) return 'text-success';
+  if (val < badThresh) return 'text-danger';
+  return 'text-warning';
+}
+
+function renderBacktestResults(data) {
+  const container = document.getElementById('bt-results');
+  let html = '';
+
+  // Overall Accuracy card
+  html += '<div class="card"><h2>Overall Accuracy</h2><div class="stats-grid">';
+  html += '<div class="stat-item"><div class="stat-value">' + data.total_games + '</div><div class="stat-label">Games Analyzed</div></div>';
+  html += '<div class="stat-item"><div class="stat-value ' + _accClass(data.spread_acc, 55, 50) + '">' + data.spread_acc.toFixed(1) + '%</div><div class="stat-label">Winner Correct</div></div>';
+  html += '<div class="stat-item"><div class="stat-value ' + _accClass(data.total_acc, 55, 50) + '">' + data.total_acc.toFixed(1) + '%</div><div class="stat-label">Total Within 10</div></div>';
+  html += '<div class="stat-item"><div class="stat-value">' + data.avg_spread_err.toFixed(1) + '</div><div class="stat-label">Avg Spread Error</div></div>';
+  html += '<div class="stat-item"><div class="stat-value">' + data.avg_total_err.toFixed(1) + '</div><div class="stat-label">Avg Total Error</div></div>';
+  html += '</div></div>';
+
+  // Team Accuracy table
+  if (data.teams && data.teams.length > 0) {
+    html += '<div class="card"><h2>Accuracy by Team</h2><div class="scroll-x"><table>';
+    html += '<thead><tr><th>Team</th><th>Record</th><th>Games</th><th>Spread %</th><th>Avg Spread Err</th><th>Total %</th><th>Avg Total Err</th></tr></thead><tbody>';
+    data.teams.forEach(function(t) {
+      html += '<tr>';
+      html += '<td>' + t.team_abbr + '</td>';
+      html += '<td>' + t.record + '</td>';
+      html += '<td>' + t.games + '</td>';
+      html += '<td class="' + (t.spread_acc >= 60 ? 'text-success' : (t.spread_acc < 45 ? 'text-danger' : '')) + '">' + t.spread_acc.toFixed(1) + '%</td>';
+      html += '<td>' + t.avg_spread_err.toFixed(1) + '</td>';
+      html += '<td class="' + (t.total_acc >= 60 ? 'text-success' : (t.total_acc < 45 ? 'text-danger' : '')) + '">' + t.total_acc.toFixed(1) + '%</td>';
+      html += '<td>' + t.avg_total_err.toFixed(1) + '</td>';
+      html += '</tr>';
+    });
+    html += '</tbody></table></div></div>';
+  }
+
+  // Predictions table
+  if (data.predictions && data.predictions.length > 0) {
+    html += '<div class="card"><h2>Recent Predictions vs Actual</h2><div class="scroll-x"><table>';
+    html += '<thead><tr><th>Date</th><th>Matchup</th><th>Final</th><th>Pred</th><th>Actual</th><th>OK?</th><th>Pred Score</th><th>Score Diff</th><th>Pred Tot</th><th>Act Tot</th><th>Tot Diff</th><th>Injuries</th></tr></thead><tbody>';
+    data.predictions.forEach(function(p) {
+      const diffAbs = Math.abs(p.total_diff);
+      const diffCls = diffAbs <= 10 ? 'text-success' : (diffAbs <= 20 ? 'text-warning' : 'text-danger');
+      const diffStr = (p.total_diff >= 0 ? '+' : '') + Math.round(p.total_diff);
+      html += '<tr>';
+      html += '<td>' + p.game_date + '</td>';
+      html += '<td>' + p.matchup + '</td>';
+      html += '<td>' + p.final_score + '</td>';
+      html += '<td>' + p.pred_winner + '</td>';
+      html += '<td>' + p.actual_winner + '</td>';
+      html += '<td class="' + (p.winner_correct ? 'text-success' : 'text-danger') + '">' + (p.winner_correct ? 'Y' : 'N') + '</td>';
+      html += '<td>' + p.pred_score + '</td>';
+      html += '<td>' + p.score_diff + '</td>';
+      html += '<td>' + p.pred_total + '</td>';
+      html += '<td>' + p.actual_total + '</td>';
+      html += '<td class="' + diffCls + '">' + diffStr + '</td>';
+      html += '<td class="' + (p.has_injuries ? 'text-danger' : '') + '">' + p.injuries + '</td>';
+      html += '</tr>';
+    });
+    html += '</tbody></table></div></div>';
+  }
+
+  container.innerHTML = html;
+}
+
+function _disableOptButtons(disabled) {
+  ['btn-optimize','btn-calibrate','btn-features','btn-grouped','btn-ml-features','btn-team-refine','btn-fft','btn-clear-weights','btn-optimize-all','btn-pipeline','btn-ml-train','btn-continuous'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.disabled = disabled;
+  });
+  // Show/hide cancel button
+  const cancelBtn = document.getElementById('btn-cancel-pipeline');
+  if (cancelBtn) cancelBtn.style.display = disabled ? 'inline-block' : 'none';
+}
+
+function _appendLog(msg) {
+  const log = document.getElementById('opt-log');
+  log.style.display = 'block';
+  const div = document.createElement('div');
+  div.textContent = msg;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+
+function startOptimize() {
+  _disableOptButtons(true);
+  const log = document.getElementById('opt-log');
+  log.innerHTML = '';
+  log.style.display = 'block';
+  document.getElementById('opt-results').style.display = 'none';
+  _appendLog('Starting weight optimisation...');
+
+  const trials = parseInt(document.getElementById('opt-trials').value) || 200;
+  const es = new EventSource('/api/optimize?trials=' + trials);
+  es.onmessage = function(e) {
+    const msg = e.data;
+    if (msg.startsWith('[DONE]')) {
+      _appendLog(msg);
+      es.close();
+      _disableOptButtons(false);
+      loadWeights();
+    } else if (msg.startsWith('[ERROR]')) {
+      _appendLog('ERROR: ' + msg);
+      es.close();
+      _disableOptButtons(false);
+    } else {
+      _appendLog(msg);
+    }
+  };
+  es.onerror = function() { es.close(); _disableOptButtons(false); };
+}
+
+function startCalibrate() {
+  _disableOptButtons(true);
+  const log = document.getElementById('opt-log');
+  log.innerHTML = '';
+  log.style.display = 'block';
+  document.getElementById('opt-results').style.display = 'none';
+  _appendLog('Building residual calibration...');
+
+  const results = [];
+  const es = new EventSource('/api/calibrate');
+  es.onmessage = function(e) {
+    const msg = e.data;
+    if (msg.startsWith('[DONE]')) {
+      _appendLog(msg);
+      es.close();
+      _disableOptButtons(false);
+      showCalibrationResults(results);
+    } else if (msg.startsWith('[RESULT]')) {
+      results.push(msg.replace('[RESULT] ', ''));
+      _appendLog(msg);
+    } else if (msg.startsWith('[ERROR]')) {
+      _appendLog('ERROR: ' + msg);
+      es.close();
+      _disableOptButtons(false);
+    } else {
+      _appendLog(msg);
+    }
+  };
+  es.onerror = function() { es.close(); _disableOptButtons(false); };
+}
+
+function startFeatureImportance() {
+  _disableOptButtons(true);
+  const log = document.getElementById('opt-log');
+  log.innerHTML = '';
+  log.style.display = 'block';
+  document.getElementById('opt-results').style.display = 'none';
+  _appendLog('Running feature importance analysis...');
+
+  const results = [];
+  const es = new EventSource('/api/feature-importance');
+  es.onmessage = function(e) {
+    const msg = e.data;
+    if (msg.startsWith('[DONE]')) {
+      _appendLog(msg);
+      es.close();
+      _disableOptButtons(false);
+      showFeatureResults(results);
+    } else if (msg.startsWith('[RESULT]')) {
+      results.push(msg.replace('[RESULT] ', ''));
+      _appendLog(msg);
+    } else if (msg.startsWith('[ERROR]')) {
+      _appendLog('ERROR: ' + msg);
+      es.close();
+      _disableOptButtons(false);
+    } else {
+      _appendLog(msg);
+    }
+  };
+  es.onerror = function() { es.close(); _disableOptButtons(false); };
+}
+
+function clearWeights() {
+  fetch('/api/weights/clear', {method: 'POST'}).then(r => r.json()).then(d => {
+    _appendLog('Weights reset to defaults');
+  });
+}
+
+function loadWeights() {
+  fetch('/api/weights').then(r => r.json()).then(weights => {
+    const container = document.getElementById('opt-results');
+    container.style.display = 'block';
+    let html = '<h3>Optimised Weights</h3><div class="scroll-x"><table><thead><tr><th>Weight</th><th>Value</th></tr></thead><tbody>';
+    for (const [k, v] of Object.entries(weights)) {
+      html += '<tr><td>' + k + '</td><td>' + Number(v).toFixed(4) + '</td></tr>';
+    }
+    html += '</tbody></table></div>';
+    container.innerHTML = html;
+  });
+}
+
+function showCalibrationResults(results) {
+  const container = document.getElementById('opt-results');
+  container.style.display = 'block';
+  let html = '<h3>Calibration Bins</h3><div class="scroll-x"><table><thead><tr><th>Bin</th><th>Range</th><th>Avg Residual</th><th>Samples</th></tr></thead><tbody>';
+  results.forEach(r => {
+    const parts = {};
+    r.split(',').forEach(p => { const [k,v] = p.split('='); parts[k.trim()] = v; });
+    const cls = parseFloat(parts.residual) > 0 ? 'text-warning' : 'text-success';
+    html += '<tr><td>' + (parts.bin||'') + '</td><td>' + (parts.range||'') + '</td><td class="' + cls + '">' + (parts.residual||'') + '</td><td>' + (parts.n||'') + '</td></tr>';
+  });
+  html += '</tbody></table></div>';
+  container.innerHTML = html;
+}
+
+function showFeatureResults(results) {
+  const container = document.getElementById('opt-results');
+  container.style.display = 'block';
+  let html = '<h3>Feature Importance</h3><div class="scroll-x"><table><thead><tr><th>Feature</th><th>Impact</th><th>Impact %</th><th>Verdict</th></tr></thead><tbody>';
+  results.forEach(r => {
+    const parts = {};
+    r.split(',').forEach(p => { const [k,v] = p.split('='); parts[k.trim()] = v; });
+    const verdict = parts.verdict || 'neutral';
+    const cls = verdict === 'HELPS' ? 'text-success' : (verdict === 'HURTS' ? 'text-danger' : '');
+    html += '<tr><td>' + (parts.feature||'') + '</td><td>' + (parts.impact||'') + '</td><td>' + (parts.impact_pct||'') + '</td><td class="' + cls + '">' + verdict + '</td></tr>';
+  });
+  html += '</tbody></table></div>';
+  container.innerHTML = html;
+}
+
+function startGroupedImportance() {
+  _disableOptButtons(true);
+  const log = document.getElementById('opt-log');
+  log.innerHTML = '';
+  log.style.display = 'block';
+  document.getElementById('opt-results').style.display = 'none';
+  _appendLog('Running grouped feature importance (interaction effects)...');
+
+  const results = [];
+  const es = new EventSource('/api/grouped-feature-importance');
+  es.onmessage = function(e) {
+    const msg = e.data;
+    if (msg === '[DONE]') {
+      es.close();
+      _disableOptButtons(false);
+      showGroupedResults(results);
+    } else if (msg.startsWith('[RESULT]')) {
+      results.push(msg.replace('[RESULT] ', ''));
+      _appendLog(msg);
+    } else if (msg.startsWith('[ERROR]')) {
+      _appendLog('ERROR: ' + msg);
+      es.close();
+      _disableOptButtons(false);
+    } else {
+      _appendLog(msg);
+    }
+  };
+  es.onerror = function() { es.close(); _disableOptButtons(false); };
+}
+
+function showGroupedResults(results) {
+  const container = document.getElementById('opt-results');
+  container.style.display = 'block';
+  let html = '<h3>Grouped Feature Importance</h3><div class="scroll-x"><table><thead><tr><th>Group</th><th>Weights</th><th>Impact</th><th>Impact %</th><th>Verdict</th></tr></thead><tbody>';
+  results.forEach(r => {
+    const parts = {};
+    r.split(',').forEach(p => { const [k,...v] = p.split('='); parts[k.trim()] = v.join('='); });
+    const verdict = parts.verdict || 'neutral';
+    const cls = verdict === 'HELPS' ? 'text-success' : (verdict === 'HURTS' ? 'text-danger' : '');
+    html += '<tr><td>' + (parts.group||'') + '</td><td style="font-size:11px">' + (parts.weights||'') + '</td><td>' + (parts.impact||'') + '</td><td>' + (parts.impact_pct||'') + '</td><td class="' + cls + '">' + verdict + '</td></tr>';
+  });
+  html += '</tbody></table></div>';
+  container.innerHTML = html;
+}
+
+function startMLFeatureImportance() {
+  _disableOptButtons(true);
+  const log = document.getElementById('opt-log');
+  log.innerHTML = '';
+  log.style.display = 'block';
+  document.getElementById('opt-results').style.display = 'none';
+  _appendLog('Starting ML feature importance (XGBoost + SHAP)...');
+
+  const results = [];
+  const es = new EventSource('/api/ml-feature-importance');
+  es.onmessage = function(e) {
+    const msg = e.data;
+    if (msg.startsWith('[DONE]')) {
+      _appendLog(msg);
+      es.close();
+      _disableOptButtons(false);
+      showMLFeatureResults(results);
+    } else if (msg.startsWith('[RESULT]')) {
+      results.push(msg.replace('[RESULT] ', ''));
+      _appendLog(msg);
+    } else if (msg.startsWith('[ERROR]')) {
+      _appendLog('ERROR: ' + msg);
+      es.close();
+      _disableOptButtons(false);
+    } else {
+      _appendLog(msg);
+    }
+  };
+  es.onerror = function() { es.close(); _disableOptButtons(false); };
+}
+
+function showMLFeatureResults(results) {
+  const container = document.getElementById('opt-results');
+  container.style.display = 'block';
+  let html = '<h3>ML Feature Importance (SHAP)</h3><div class="scroll-x"><table><thead><tr><th>Feature</th><th>SHAP Importance</th><th>Direction</th></tr></thead><tbody>';
+  results.forEach(r => {
+    const parts = {};
+    r.split(',').forEach(p => { const [k,v] = p.split('='); parts[k.trim()] = v; });
+    const dir = parts.direction || 'mixed';
+    const cls = dir === 'positive' ? 'text-success' : (dir === 'negative' ? 'text-danger' : '');
+    html += '<tr><td>' + (parts.feature||'') + '</td><td>' + (parts.shap||'') + '</td><td class="' + cls + '">' + dir + '</td></tr>';
+  });
+  html += '</tbody></table></div>';
+  container.innerHTML = html;
+}
+
+function startFFTAnalysis() {
+  _disableOptButtons(true);
+  const log = document.getElementById('opt-log');
+  log.innerHTML = '';
+  log.style.display = 'block';
+  document.getElementById('opt-results').style.display = 'none';
+  _appendLog('Starting FFT error pattern analysis...');
+
+  const results = [];
+  const es = new EventSource('/api/fft-analysis');
+  es.onmessage = function(e) {
+    const msg = e.data;
+    if (msg.startsWith('[DONE]')) {
+      _appendLog(msg);
+      es.close();
+      _disableOptButtons(false);
+      showFFTResults(results);
+    } else if (msg.startsWith('[RESULT]')) {
+      results.push(msg.replace('[RESULT] ', ''));
+      _appendLog(msg);
+    } else if (msg.startsWith('[ERROR]')) {
+      _appendLog('ERROR: ' + msg);
+      es.close();
+      _disableOptButtons(false);
+    } else {
+      _appendLog(msg);
+    }
+  };
+  es.onerror = function() { es.close(); _disableOptButtons(false); };
+}
+
+function startMLTrain() {
+  _disableOptButtons(true);
+  const log = document.getElementById('opt-log');
+  log.innerHTML = '';
+  log.style.display = 'block';
+  document.getElementById('opt-results').style.display = 'none';
+  _appendLog('Training ML ensemble models (XGBoost spread + total)...');
+
+  const metrics = {};
+  const shapSpread = [];
+  const shapTotal = [];
+  const gainSpread = [];
+  const gainTotal = [];
+  const es = new EventSource('/api/ml-train');
+  es.onmessage = function(e) {
+    const msg = e.data;
+    if (msg.startsWith('[DONE]')) {
+      _appendLog(msg);
+      es.close();
+      _disableOptButtons(false);
+      showMLTrainResults(metrics, shapSpread, shapTotal, gainSpread, gainTotal);
+    } else if (msg.startsWith('[METRIC]')) {
+      const raw = msg.replace('[METRIC] ', '');
+      raw.split(',').forEach(p => { const [k,...v] = p.split('='); metrics[k.trim()] = v.join('='); });
+      _appendLog(msg);
+    } else if (msg.startsWith('[SHAP_SPREAD]')) {
+      const raw = msg.replace('[SHAP_SPREAD] ', '');
+      const [name,...v] = raw.split('=');
+      shapSpread.push({name: name.trim(), imp: v.join('=')});
+    } else if (msg.startsWith('[SHAP_TOTAL]')) {
+      const raw = msg.replace('[SHAP_TOTAL] ', '');
+      const [name,...v] = raw.split('=');
+      shapTotal.push({name: name.trim(), imp: v.join('=')});
+    } else if (msg.startsWith('[GAIN_SPREAD]')) {
+      const raw = msg.replace('[GAIN_SPREAD] ', '');
+      const [name,...v] = raw.split('=');
+      gainSpread.push({name: name.trim(), gain: v.join('=')});
+    } else if (msg.startsWith('[GAIN_TOTAL]')) {
+      const raw = msg.replace('[GAIN_TOTAL] ', '');
+      const [name,...v] = raw.split('=');
+      gainTotal.push({name: name.trim(), gain: v.join('=')});
+    } else if (msg.startsWith('[ERROR]')) {
+      _appendLog('ERROR: ' + msg);
+      es.close();
+      _disableOptButtons(false);
+    } else {
+      _appendLog(msg);
+    }
+  };
+  es.onerror = function() { es.close(); _disableOptButtons(false); };
+}
+
+function showMLTrainResults(metrics, shapSpread, shapTotal, gainSpread, gainTotal) {
+  const container = document.getElementById('opt-results');
+  container.style.display = 'block';
+  let html = '<h3>ML Ensemble Training Results</h3>';
+
+  // Metrics summary
+  html += '<div class="stats-grid" style="margin-bottom:16px;">';
+  html += '<div class="stat-card"><div class="stat-value">' + (metrics.spread_val_mae || '--') + '</div><div class="stat-label">Spread Val MAE</div></div>';
+  html += '<div class="stat-card"><div class="stat-value">' + (metrics.total_val_mae || '--') + '</div><div class="stat-label">Total Val MAE</div></div>';
+  html += '<div class="stat-card"><div class="stat-value">' + (metrics.n_train || '--') + '</div><div class="stat-label">Train Games</div></div>';
+  html += '<div class="stat-card"><div class="stat-value">' + (metrics.n_val || '--') + '</div><div class="stat-label">Val Games</div></div>';
+  html += '<div class="stat-card"><div class="stat-value">' + (metrics.n_features || '--') + '</div><div class="stat-label">Features</div></div>';
+  html += '</div>';
+
+  // SHAP features table (prefer SHAP, fallback to gain)
+  const hasShap = shapSpread.length > 0;
+  const features = hasShap ? shapSpread : gainSpread;
+  const featureLabel = hasShap ? 'SHAP Importance' : 'Gain Importance';
+  const totalMap = {};
+  (hasShap ? shapTotal : gainTotal).forEach(f => { totalMap[f.name] = hasShap ? f.imp : f.gain; });
+
+  if (features.length > 0) {
+    html += '<h4>Top Features (' + featureLabel + ')</h4>';
+    html += '<div class="scroll-x"><table><thead><tr><th>Feature</th><th>Spread ' + featureLabel + '</th><th>Total ' + featureLabel + '</th></tr></thead><tbody>';
+    features.forEach(f => {
+      const totalVal = totalMap[f.name] || '0.0';
+      html += '<tr><td>' + f.name + '</td><td>' + (hasShap ? f.imp : f.gain) + '</td><td>' + totalVal + '</td></tr>';
+    });
+    html += '</tbody></table></div>';
+  }
+
+  container.innerHTML = html;
+}
+
+function startTeamRefinement() {
+  _disableOptButtons(true);
+  const log = document.getElementById('opt-log');
+  log.innerHTML = '';
+  log.style.display = 'block';
+  document.getElementById('opt-results').style.display = 'none';
+  _appendLog('Starting per-team weight refinement...');
+
+  const trials = parseInt(document.getElementById('opt-trials').value) || 100;
+  const results = [];
+  const es = new EventSource('/api/team-refinement?trials=' + trials);
+  es.onmessage = function(e) {
+    const msg = e.data;
+    if (msg.startsWith('[DONE]')) {
+      _appendLog(msg);
+      es.close();
+      _disableOptButtons(false);
+      showTeamRefinementResults(results);
+    } else if (msg.startsWith('[RESULT]')) {
+      results.push(msg.replace('[RESULT] ', ''));
+      _appendLog(msg);
+    } else if (msg.startsWith('[ERROR]')) {
+      _appendLog('ERROR: ' + msg);
+      es.close();
+      _disableOptButtons(false);
+    } else {
+      _appendLog(msg);
+    }
+  };
+  es.onerror = function() { es.close(); _disableOptButtons(false); };
+}
+
+function showTeamRefinementResults(results) {
+  const container = document.getElementById('opt-results');
+  container.style.display = 'block';
+  let html = '<h3>Per-Team Weight Refinement</h3>';
+  html += '<div class="scroll-x"><table><thead><tr><th>Team</th><th>Decision</th><th>Global (holdout)</th><th>Per-Team (holdout)</th><th>Reason</th></tr></thead><tbody>';
+  results.forEach(r => {
+    const parts = {};
+    r.split(',').forEach(p => { const [k,...v] = p.split('='); parts[k.trim()] = v.join('='); });
+    const decision = parts.used_team === 'true' ? 'Per-Team' : 'Global';
+    const cls = parts.used_team === 'true' ? 'text-success' : '';
+    html += '<tr><td>' + (parts.abbr||'') + '</td><td class="' + cls + '">' + decision + '</td><td>' + (parts.global_holdout||'') + '</td><td>' + (parts.team_holdout||'') + '</td><td style="font-size:12px;">' + (parts.reason||'') + '</td></tr>';
+  });
+  html += '</tbody></table></div>';
+  container.innerHTML = html;
+}
+
+function showFFTResults(results) {
+  const container = document.getElementById('opt-results');
+  container.style.display = 'block';
+  let html = '<h3>Error Pattern Analysis (FFT)</h3>';
+  if (results.length === 0 || (results.length === 1 && results[0].includes('No significant'))) {
+    html += '<p class="text-success" style="font-weight:600;">No significant periodic error patterns detected — prediction errors are random (good!)</p>';
+  } else {
+    html += '<div class="scroll-x"><table><thead><tr><th>Pattern</th><th>Period (games)</th><th>Period (days)</th><th>Strength</th></tr></thead><tbody>';
+    results.forEach(r => {
+      const parts = {};
+      r.split(',').forEach(p => { const [k,v] = p.split('='); parts[k.trim()] = v; });
+      const mag = parseFloat(parts.magnitude || 0);
+      const cls = mag > 0.7 ? 'text-danger' : (mag > 0.4 ? 'text-warning' : '');
+      html += '<tr><td>' + (parts.description||'') + '</td><td>' + (parts.period_games||'') + '</td><td>' + (parts.period_days||'') + '</td><td class="' + cls + '">' + (parts.magnitude||'') + '</td></tr>';
+    });
+    html += '</tbody></table></div>';
+  }
+  container.innerHTML = html;
+}
+
+// ── Optimize All (global + per-team) ──
+function startOptimizeAll() {
+  _disableOptButtons(true);
+  const log = document.getElementById('opt-log');
+  log.innerHTML = '';
+  log.style.display = 'block';
+  document.getElementById('opt-results').style.display = 'none';
+  _appendLog('Starting combo optimisation (global + per-team)...');
+
+  const trials = parseInt(document.getElementById('opt-trials').value) || 200;
+  const teamResults = [];
+  const es = new EventSource('/api/optimize-all?trials=' + trials);
+  es.onmessage = function(e) {
+    const msg = e.data;
+    if (msg.startsWith('[DONE]')) {
+      _appendLog(msg);
+      es.close();
+      _disableOptButtons(false);
+      if (teamResults.length) showTeamRefinementResults(teamResults);
+    } else if (msg.startsWith('[TEAM]')) {
+      teamResults.push(msg.replace('[TEAM] ', ''));
+    } else if (msg.startsWith('[RESULT]')) {
+      _appendLog(msg.replace('[RESULT] ', ''));
+    } else if (msg.startsWith('[ERROR]')) {
+      _appendLog('ERROR: ' + msg);
+      es.close();
+      _disableOptButtons(false);
+    } else {
+      _appendLog(msg);
+    }
+  };
+  es.onerror = function() { es.close(); _disableOptButtons(false); };
+}
+
+// ── Full Pipeline ──
+function startFullPipeline() {
+  _disableOptButtons(true);
+  const log = document.getElementById('opt-log');
+  log.innerHTML = '';
+  log.style.display = 'block';
+  document.getElementById('opt-results').style.display = 'none';
+  _appendLog('Starting full optimisation pipeline...');
+
+  const trials = parseInt(document.getElementById('opt-trials').value) || 200;
+  const workers = parseInt(document.getElementById('workers').value) || 4;
+  const forceRerun = document.getElementById('force-rerun').checked ? '1' : '0';
+
+  const stepResults = [];
+  const url = '/api/full-pipeline?trials=' + trials + '&max_workers=' + workers + '&force_rerun=' + forceRerun;
+  const es = new EventSource(url);
+  es.onmessage = function(e) {
+    const msg = e.data;
+    if (msg.startsWith('[DONE]')) {
+      _appendLog(msg);
+      es.close();
+      _disableOptButtons(false);
+      if (stepResults.length) showPipelineResults(stepResults);
+    } else if (msg.startsWith('[STEP]')) {
+      stepResults.push(msg.replace('[STEP] ', ''));
+    } else if (msg.startsWith('[RESULT]')) {
+      _appendLog(msg.replace('[RESULT] ', ''));
+    } else if (msg.startsWith('[ERROR]')) {
+      _appendLog('ERROR: ' + msg);
+      es.close();
+      _disableOptButtons(false);
+    } else {
+      _appendLog(msg);
+    }
+  };
+  es.onerror = function() { es.close(); _disableOptButtons(false); };
+}
+
+function cancelRunning() {
+  // Cancel both pipeline and continuous — whichever is active
+  fetch('/api/pipeline/cancel', {method: 'POST'}).catch(() => {});
+  fetch('/api/continuous-optimize/cancel', {method: 'POST'}).catch(() => {});
+  _appendLog('Cancellation requested — will stop after current round...');
+  const cancelBtn = document.getElementById('btn-cancel-pipeline');
+  if (cancelBtn) cancelBtn.disabled = true;
+}
+
+function startContinuousOpt() {
+  _disableOptButtons(true);
+  const log = document.getElementById('opt-log');
+  log.innerHTML = '';
+  log.style.display = 'block';
+  document.getElementById('opt-results').style.display = 'none';
+  _appendLog('Starting continuous optimisation (loops until cancelled)...');
+  _appendLog('Click Cancel to stop — best results are always kept.\n');
+
+  const trials = parseInt(document.getElementById('opt-trials').value) || 200;
+  const es = new EventSource('/api/continuous-optimize?trials=' + trials);
+  es.onmessage = function(e) {
+    const msg = e.data;
+    if (msg.startsWith('[DONE]')) {
+      _appendLog(msg);
+      es.close();
+      _disableOptButtons(false);
+    } else if (msg.startsWith('[RESULT]')) {
+      const parts = {};
+      msg.replace('[RESULT] ', '').split(',').forEach(p => {
+        const [k,...v] = p.split('=');
+        parts[k.trim()] = v.join('=');
+      });
+      showContinuousResults(parts);
+    } else if (msg.startsWith('[ERROR]')) {
+      _appendLog('ERROR: ' + msg);
+      es.close();
+      _disableOptButtons(false);
+    } else {
+      _appendLog(msg);
+    }
+  };
+  es.onerror = function() { es.close(); _disableOptButtons(false); };
+}
+
+function showContinuousResults(parts) {
+  const container = document.getElementById('opt-results');
+  container.style.display = 'block';
+  let html = '<h3>Continuous Optimisation Results</h3>';
+  html += '<div class="stats-grid" style="margin-bottom:16px;">';
+  html += '<div class="stat-card"><div class="stat-value">' + (parts.rounds || '--') + '</div><div class="stat-label">Rounds</div></div>';
+  html += '<div class="stat-card"><div class="stat-value">' + (parts.improvements || '--') + '</div><div class="stat-label">Improvements</div></div>';
+  html += '<div class="stat-card"><div class="stat-value">' + (parts.starting_loss || '--') + '</div><div class="stat-label">Starting Loss</div></div>';
+  html += '<div class="stat-card"><div class="stat-value">' + (parts.best_loss || '--') + '</div><div class="stat-label">Best Loss</div></div>';
+  html += '<div class="stat-card"><div class="stat-value">' + (parts.teams_refined || '--') + '</div><div class="stat-label">Teams Refined</div></div>';
+  html += '<div class="stat-card"><div class="stat-value">' + (parts.seconds || '--') + 's</div><div class="stat-label">Total Time</div></div>';
+  html += '</div>';
+  container.innerHTML = html;
+}
+
+function showPipelineResults(steps) {
+  const container = document.getElementById('opt-results');
+  container.style.display = 'block';
+  let html = '<h3>Pipeline Step Summary</h3>';
+  html += '<div class="scroll-x"><table><thead><tr><th>Step</th><th>Status</th><th>Time (s)</th></tr></thead><tbody>';
+  steps.forEach(s => {
+    const parts = {};
+    s.split(',').forEach(p => { const [k,v] = p.split('='); parts[k.trim()] = v; });
+    const status = parts.status || '?';
+    const cls = status === 'done' ? 'text-success' : (status === 'skipped' ? 'text-muted' : (status === 'error' ? 'text-danger' : ''));
+    html += '<tr><td>' + (parts.name||'') + '</td><td class="' + cls + '">' + status + '</td><td>' + (parts.seconds||'') + '</td></tr>';
+  });
+  html += '</tbody></table></div>';
+  container.innerHTML = html;
+}
+
+// ── Backtest cache age indicator ──
+function updateCacheAge() {
+  const home = document.getElementById('home').value || '';
+  const away = document.getElementById('away').value || '';
+  const inj = document.getElementById('injuries').value;
+  const span = document.getElementById('cache-age');
+  fetch('/api/backtest-cache-age?home_team_id=' + encodeURIComponent(home) +
+        '&away_team_id=' + encodeURIComponent(away) +
+        '&use_injuries=' + encodeURIComponent(inj))
+    .then(r => r.json())
+    .then(data => {
+      const age = data.age_minutes;
+      if (age == null) {
+        span.textContent = '(no cache)';
+      } else if (age < 1) {
+        span.textContent = '(cached <1 min ago)';
+      } else if (age < 60) {
+        span.textContent = '(cached ' + Math.round(age) + ' min ago)';
+      } else {
+        span.textContent = '(cached ' + (age / 60).toFixed(1) + ' hr ago)';
+      }
+    })
+    .catch(() => { span.textContent = ''; });
+}
+// Update on page load and whenever filters change
+document.addEventListener('DOMContentLoaded', function() {
+  updateCacheAge();
+  document.getElementById('home').addEventListener('change', updateCacheAge);
+  document.getElementById('away').addEventListener('change', updateCacheAge);
+  document.getElementById('injuries').addEventListener('change', updateCacheAge);
+});
+</script>
+{% endblock %}

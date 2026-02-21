@@ -1,0 +1,150 @@
+{% extends "base.html" %}
+{% block content %}
+<h1 class="page-title">Players</h1>
+
+<div class="card">
+  <h2>Add Manual Injury</h2>
+  <p class="text-muted">Add injuries not yet reported by official sources.</p>
+  
+  <form action="/players/injury/add" method="post" class="injury-form">
+    <div class="form-row">
+      <input type="text" name="player" placeholder="Player Name" required>
+      <input type="text" name="team" placeholder="Team Name" required>
+    </div>
+    <div class="form-row">
+      <input type="text" name="position" placeholder="Position (G/F/C)">
+      <select name="status">
+        <option value="Out">Out</option>
+        <option value="Doubtful">Doubtful</option>
+        <option value="Questionable">Questionable</option>
+        <option value="Probable">Probable</option>
+        <option value="Day-to-Day">Day-to-Day</option>
+      </select>
+    </div>
+    <div class="form-row">
+      <input type="text" name="injury" placeholder="Injury (e.g., Ankle, Knee)" style="flex: 2;">
+      <button type="submit" class="btn btn-primary">Add Injury</button>
+    </div>
+  </form>
+</div>
+
+{% if manual_injuries %}
+<div class="card">
+  <h2>Manual Injuries</h2>
+  <p class="text-muted">{{ manual_injuries|length }} manually added</p>
+  
+  <div class="scroll-x">
+    <table>
+      <thead>
+        <tr>
+          <th>Player</th>
+          <th>Team</th>
+          <th>Pos</th>
+          <th>Status</th>
+          <th>Injury</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for inj in manual_injuries %}
+        <tr>
+          <td>{{ inj.player }}</td>
+          <td>{{ inj.team }}</td>
+          <td>{{ inj.position or '-' }}</td>
+          <td class="text-danger">{{ inj.status }}</td>
+          <td>{{ inj.injury or '-' }}</td>
+          <td>
+            <form action="/players/injury/remove" method="post" style="display: inline;">
+              <input type="hidden" name="player" value="{{ inj.player }}">
+              <input type="hidden" name="team" value="{{ inj.team }}">
+              <button type="submit" class="btn btn-small btn-danger">Remove</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>Injured Players</h2>
+  <div class="status" style="color: var(--danger);">{{ injured_count }} injured</div>
+  
+  {% if injured %}
+  <div class="scroll-x">
+    <table>
+      <thead>
+        <tr>
+          <th class="player-photo-col"></th>
+          <th>Name</th>
+          <th>Pos</th>
+          <th>Team</th>
+          <th>PPG</th>
+          <th>MPG</th>
+          <th>Injury</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in injured %}
+        {% set mpg = p.mpg|float %}
+        <tr class="{{ 'impact-high' if mpg >= 25 else 'impact-moderate' if mpg >= 15 else '' }}">
+          <td class="player-photo-col">
+            <img src="{{ player_photo_url(p.player_id) }}" width="28" height="28" class="player-photo" alt="" onerror="this.style.display='none'">
+          </td>
+          <td>
+            {{ p.name }}
+            {% if mpg >= 25 %}
+            <span class="text-danger player-tag"> HIGH IMPACT</span>
+            {% elif mpg >= 15 %}
+            <span class="text-warning player-tag"> ROTATION</span>
+            {% endif %}
+          </td>
+          <td>{{ p.position }}</td>
+          <td>{{ p.team }}</td>
+          <td>{{ "%.1f"|format(p.ppg) }}</td>
+          <td>{{ "%.1f"|format(p.mpg) }}</td>
+          <td class="text-danger">{{ p.injury_note or 'Unknown' }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty-state">
+    <p>No injured players</p>
+  </div>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>All Players</h2>
+  <p class="text-muted">{{ players|length }} total players</p>
+  
+  <div class="scroll-x">
+    <table>
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Pos</th>
+          <th>Team</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in players %}
+        <tr>
+          <td>{{ p.name }}</td>
+          <td>{{ p.position }}</td>
+          <td>{{ p.team }}</td>
+          <td class="{{ 'text-danger' if p.is_injured else 'text-success' }}">
+            {{ 'OUT' if p.is_injured else 'Active' }}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

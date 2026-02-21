@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#1e293b" />
+  <title>{{ title if title else "NBA Analytics" }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">NBA Analytics</div>
+      <button class="menu-toggle" onclick="toggleMenu()" aria-label="Menu">
+        <span></span>
+        <span></span>
+        <span></span>
+      </button>
+    </div>
+    <nav id="nav">
+      <a href="/dashboard">Dashboard</a>
+      <a href="/live">Live</a>
+      <a href="/gamecast">Gamecast</a>
+      <a href="/players">Players</a>
+      <a href="/matchups">Matchups</a>
+      <a href="/schedule">Schedule</a>
+      <a href="/accuracy">Accuracy</a>
+      <a href="/autotune">Autotune</a>
+      <a href="/admin">Admin</a>
+    </nav>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <script>
+    function toggleMenu() {
+      document.getElementById('nav').classList.toggle('open');
+    }
+    // Mark active nav link
+    const path = window.location.pathname.replace(/\/$/, '') || '/dashboard';
+    document.querySelectorAll('nav a').forEach(link => {
+      if (link.getAttribute('href') === path) link.classList.add('active');
+      // Close menu when clicking a link
+      link.addEventListener('click', () => {
+        document.getElementById('nav').classList.remove('open');
+      });
+    });
+  </script>
+</body>
+</html>

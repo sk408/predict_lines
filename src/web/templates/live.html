@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block content %}
+<meta http-equiv="refresh" content="30">
+
+<h1 class="page-title">Live Games</h1>
+
+<div class="card">
+  <h2>Live Games & Recommendations</h2>
+  <p class="last-update">Auto-refreshes every 30s &middot; Last updated {{ updated_at }}</p>
+  
+  {% if error %}
+  <div class="error-box">{{ error }}</div>
+  {% endif %}
+  
+  {% if recs %}
+  <div class="scroll-x">
+    <table>
+      <thead>
+        <tr>
+          <th>Status</th>
+          <th>Home</th>
+          <th>Away</th>
+          <th>Score</th>
+          <th>Period</th>
+          <th>Clock</th>
+          <th>Proj Spread</th>
+          <th>Proj Total</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for rec in recs %}
+        {% set is_live = rec.status.lower() in ('in_progress', 'live', 'in progress') %}
+        {% set is_final = rec.status.lower() in ('final', 'post') %}
+        <tr class="{{ 'status-live' if is_live else 'status-final' if is_final else 'status-scheduled' }}">
+          <td>{{ rec.status }}</td>
+          <td>
+            <img src="{{ team_logo_url(rec.home_team) }}" width="18" height="18" class="team-logo" alt="" onerror="this.style.display='none'">
+            {{ rec.home_team }}
+          </td>
+          <td>
+            <img src="{{ team_logo_url(rec.away_team) }}" width="18" height="18" class="team-logo" alt="" onerror="this.style.display='none'">
+            {{ rec.away_team }}
+          </td>
+          <td><strong>{{ rec.home_score }} - {{ rec.away_score }}</strong></td>
+          <td>{{ rec.period }}</td>
+          <td>{{ rec.clock }}</td>
+          <td class="{{ 'spread-home' if rec.projected_spread > 3 else 'spread-away' if rec.projected_spread < -3 else '' }}">
+            {{ "%+.1f"|format(-rec.projected_spread) }}
+          </td>
+          <td>{{ "%.1f"|format(rec.projected_total) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty-state">
+    <p>No live games at the moment</p>
+    <p class="text-muted">Check back during game time</p>
+  </div>
+  {% endif %}
+</div>
+{% endblock %}
